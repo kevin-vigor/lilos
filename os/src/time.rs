@@ -12,8 +12,8 @@
 //! provides ways to read that timer, and also to arrange for tasks to be woken
 //! at specific times (such as [`sleep_until`] and [`sleep_for`]).
 //!
-//! To use this facility in an application, you need to call
-//! [`initialize_sys_tick`] to inform the OS of the system clock speed.
+//! To use this facility in an application, you need to call the target-specific
+//! initialize_sys_tick function to inform the OS of the system clock speed.
 //! Otherwise, no operations in this module will work properly.
 //!
 //! You can get the value of tick counter using [`TickTime::now`].
@@ -84,33 +84,16 @@
 use core::future::Future;
 use core::ops::{Add, AddAssign};
 use core::pin::Pin;
-use portable_atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
+use portable_atomic::{AtomicU32, Ordering};
 
-use cortex_m::peripheral::{syst::SystClkSource, SYST};
-use cortex_m_rt::exception;
 use pin_project::pin_project;
 
 /// Bottom 32 bits of the tick counter. Updated by ISR.
 static TICK: AtomicU32 = AtomicU32::new(0);
 /// Top 32 bits of the tick counter. Updated by ISR.
 static EPOCH: AtomicU32 = AtomicU32::new(0);
-
-/// Sets up the tick counter for 1kHz operation, assuming a CPU core clock of
-/// `clock_hz`.
-///
-/// If you use this module in your application, call this before
-/// [`run_tasks`][crate::exec::run_tasks] (or a fancier version of `run_tasks`)
-/// to set up the timer for monotonic operation.
-pub fn initialize_sys_tick(syst: &mut SYST, clock_hz: u32) {
-    let cycles_per_millisecond = clock_hz / 1000;
-    syst.set_reload(cycles_per_millisecond - 1);
-    syst.clear_current();
-    syst.set_clock_source(SystClkSource::Core);
-    syst.enable_interrupt();
-    syst.enable_counter();
-}
 
 /// Represents a moment in time by the value of the system tick counter.
 /// System-specific analog of `std::time::Instant`.
@@ -130,6 +113,14 @@ impl TickTime {
             if e == e2 {
                 break TickTime(((e as u64) << 32) | (t as u64));
             }
+        }
+    }
+
+    /// Target-specific clock ISR must call this iperiodicall to increment the
+    /// timer.
+    pub(crate) fn increment() {
+        if TICK.fetch_add(1, Ordering::Release) == u32::MAX {
+            EPOCH.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -309,7 +300,8 @@ pub async fn sleep_until(deadline: TickTime) {
 ///
 /// Dropping this future does nothing in particular.
 pub fn sleep_for<D>(d: D) -> impl Future<Output = ()>
-    where TickTime: Add<D, Output = TickTime>,
+where
+    TickTime: Add<D, Output = TickTime>,
 {
     sleep_until(TickTime::now() + d)
 }
@@ -333,8 +325,12 @@ pub fn sleep_for<D>(d: D) -> impl Future<Output = ()>
 /// In this case, `await` drops the future as soon as it resolves (as always),
 /// which means the nested `some_operation()` future will be promptly dropped
 /// when we notice that the deadline has been met or exceeded.
-pub fn with_deadline<F>(deadline: TickTime, code: F) -> impl Future<Output = Option<F::Output>>
-    where F: Future,
+pub fn with_deadline<F>(
+    deadline: TickTime,
+    code: F,
+) -> impl Future<Output = Option<F::Output>>
+where
+    F: Future,
 {
     TimeLimited {
         limiter: sleep_until(deadline),
@@ -350,9 +346,13 @@ pub fn with_deadline<F>(deadline: TickTime, code: F) -> impl Future<Output = Opt
 /// as the deadline for the returned future.
 ///
 /// See [`with_deadline`] for more details.
-pub fn with_timeout<D, F>(timeout: D, code: F) -> impl Future<Output = Option<F::Output>>
-    where F: Future,
-          TickTime: Add<D, Output = TickTime>,
+pub fn with_timeout<D, F>(
+    timeout: D,
+    code: F,
+) -> impl Future<Output = Option<F::Output>>
+where
+    F: Future,
+    TickTime: Add<D, Output = TickTime>,
 {
     with_deadline(TickTime::now() + timeout, code)
 }
@@ -373,8 +373,9 @@ struct TimeLimited<A, B> {
 }
 
 impl<A, B> Future for TimeLimited<A, B>
-    where A: Future<Output = ()>,
-          B: Future,
+where
+    A: Future<Output = ()>,
+    B: Future,
 {
     type Output = Option<B::Output>;
 
@@ -470,15 +471,5 @@ impl PeriodicGate {
     pub async fn next_time(&mut self) {
         sleep_until(self.next).await;
         self.next += self.interval;
-    }
-}
-
-/// System tick ISR. Advances the tick counter. This doesn't wake any tasks; see
-/// code in `exec` for that.
-#[doc(hidden)]
-#[exception]
-fn SysTick() {
-    if TICK.fetch_add(1, Ordering::Release) == u32::MAX {
-        EPOCH.fetch_add(1, Ordering::Release);
     }
 }

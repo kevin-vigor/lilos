@@ -25,12 +25,19 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 
-use cortex_m_semihosting::hprintln;
+#[cfg(target_arch = "arm")]
+use cortex_m_semihosting as semihosting;
+
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+use riscv_semihosting as semihosting;
+
+use semihosting::hprintln;
 use lilos::exec;
 use lilos::time;
 
 pub fn run_test_suite(hz: u32) -> ! {
     // Check out peripherals from the runtime.
+     #[cfg(target_arch = "arm")]
     let mut cp = cortex_m::Peripherals::take().unwrap();
 
     // Tasks
@@ -46,7 +53,15 @@ pub fn run_test_suite(hz: u32) -> ! {
 
     let start_mask = 0b011;
 
-    time::initialize_sys_tick(&mut cp.SYST, hz);
+    #[cfg(target_arch = "arm")]
+    lilos::cortex_m_timer::initialize_sys_tick(&mut cp.SYST, hz);
+
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    {
+        _ = hz;
+        lilos::clint::initialize_sys_tick();
+    }
+
     exec::run_tasks(
         &mut [
             coordinator,
@@ -72,9 +87,9 @@ macro_rules! async_tests {
         $(
             $(#[$attr])*
             {
-                cortex_m_semihosting::hprint!(concat!(stringify!($name), "... "));
+                semihosting::hprint!(concat!(stringify!($name), "... "));
                 $name().await;
-                cortex_m_semihosting::hprintln!("OK");
+                semihosting::hprintln!("OK");
             }
          )*
     };
@@ -186,7 +201,7 @@ async fn task_coordinator() -> Infallible {
     match time::with_timeout(TEST_TIMEOUT, tests).await {
         Some(()) => {
             hprintln!("tests complete.");
-            cortex_m_semihosting::debug::exit(Ok(()));
+            semihosting::debug::exit(Ok(()));
         }
         None => {
             panic!("tests timed out.");
